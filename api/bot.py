@@ -3,6 +3,8 @@ from web3 import Web3
 from web3.middleware import geth_poa_middleware
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 import json
+import plotly.graph_objects as go
+import pandas as pd
 from datetime import datetime, timedelta
 from pymongo import MongoClient
 import logging
@@ -115,26 +117,69 @@ def get_price(pair, contract):
         logger.error(f"Price error for {pair}: {e}")
         return {"price": 0, "liquidity": 0, "market_cap": 0, "volume_24h": 0}
 
+# Generate Chart
+def generate_chart(pair, timeframe='24h'):
+    delta = {"1h": timedelta(hours=1), "24h": timedelta(hours=24), "7d": timedelta(days=7)}
+    df = pd.DataFrame(prices.find({
+        "pair": pair,
+        "timestamp": {"$gt": datetime.now() - delta[timeframe]}
+    }))
+    if df.empty:
+        return None
+    df['timestamp'] = pd.to_datetime(df['timestamp'])
+    df.sort_values('timestamp', inplace=True)
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=df['timestamp'],
+        y=df['price'],
+        mode='lines',
+        name='Price (USD)',
+        line=dict(color='#00ff00')
+    ))
+    fig.add_trace(go.Scatter(
+        x=df['timestamp'],
+        y=df['liquidity'],
+        mode='lines',
+        name='Liquidity (USD)',
+        yaxis='y2',
+        line=dict(color='#ff00ff')
+    ))
+    fig.update_layout(
+        title=f"{pair} Price & Liquidity ({timeframe})",
+        xaxis_title="Time",
+        yaxis_title="Price (USD)",
+        yaxis2=dict(title="Liquidity (USD)", overlaying='y', side='right'),
+        template='plotly_dark',
+        plot_bgcolor='#111',
+        paper_bgcolor='#111',
+        font=dict(color='#fff')
+    )
+    chart_file = f"/tmp/chart_{pair}.png"
+    fig.write_image(chart_file)
+    return chart_file
+
 # Vercel Handler
 async def handler(req):
     bot = Bot(TELEGRAM_TOKEN)
     body = await req.json() if req.method == "POST" else {}
     command = body.get("message", {}).get("text", "")
     chat_id = body.get("message", {}).get("chat", {}).get("id", CHAT_ID)
-    user_id = body.get("message", {}).get("from", {}).get("id", 0)
+    user_id = body.get("message", {}).get("from", {}).get("id")
 
-    if command == "/start":
+    if command.startswith("/start"):
         update_user_settings(user_id, {"alerts": True, "thresholds": {}, "wallets": [], "chat_id": chat_id})
-        await bot.send_message(
-            chat_id=chat_id,
-            text="Welcome to BESC Bot! 🚀\n/stats <pair> - View stats\n/setalert price > 0.1\n/portfolio\n/addwallet <address>\n/alerts on/off"
-        )
+        await bot.send_message(chat_id=chat_id, text="Welcome to BESC Bot! 🚀\n/chart <pair> - View charts\n/stats <pair> - View stats\n/setalert price > 0.1\n/portfolio\n/alerts on/off")
     elif command.startswith("/chart"):
-        await bot.send_message(chat_id=chart_id, text="Charting disabled to reduce function size.")
-    elif command.startswith("/stats"):
         pair = command.split()[1] if len(command.split()) > 1 else "BESC-BUSDC"
         if pair not in contracts:
             await bot.send_message(chat_id=chat_id, text="Use: BESC-BUSDC, BESC-VSG, Money-BESC")
+            return {"statusCode": HTTPStatus.OK}
+        keyboard = [[InlineKeyboardButton(t, callback_data=f"chart_{pair}_{t}") for t in ["1h", "24h", "7d"]]]
+        await bot.send_message(chat_id=chat_id, text=f"Select timeframe for {pair}:", reply_markup=InlineKeyboardMarkup(keyboard))
+    elif command.startswith("/stats"):
+        pair = command.split()[1] if len(command.split()) > 1 else "BESC-BUSDC"
+        if pair not in contracts:
+            await bot.send_message(chat_id=chat_id, text="Invalid pair.")
             return {"statusCode": HTTPStatus.OK}
         metrics = get_price(pair, contracts[pair])
         reply = f"📊 *{pair} Stats*\n" \
@@ -146,7 +191,7 @@ async def handler(req):
     elif command.startswith("/setalert"):
         args = command.split()[1:]
         if not args:
-            await bot.send_message(chat_id=chat_id, text="Use: /setalert price > 0.1")
+            await bot.send_message(chat_id=chat_id, text="Usage: /setalert price > 0.1")
             return {"statusCode": HTTPStatus.OK}
         try:
             threshold = float(args[2])
@@ -170,11 +215,7 @@ async def handler(req):
             return {"statusCode": HTTPStatus.OK}
         reply = "💼 *Portfolio*\n"
         for wallet in wallets:
-            try:
-                balance = w3.eth.get_balance(wallet) / 10 ** 18
-                reply += f"Wallet {wallet[:6]}...: {balance:.4f} VSG\n"
-            except:
-                reply += f"Wallet {wallet[:6]}...: Error fetching balance\n"
+            reply += f"Wallet {wallet[:6]}...: Not implemented yet\n"
         await bot.send_message(chat_id=chat_id, text=reply, parse_mode="Markdown")
     elif command.startswith("/addwallet"):
         wallet = command.split()[1] if len(command.split()) > 1 else ""
@@ -186,27 +227,32 @@ async def handler(req):
         update_user_settings(user_id, settings)
         await bot.send_message(chat_id=chat_id, text=f"Wallet {wallet[:6]}... added.")
     elif body.get("callback_query"):
-        await bot.send_message(chat_id=chat_id, text="Charting disabled.")
+        query = body["callback_query"]
+        data = query["data"]
+        _, pair, timeframe = data.split('_')
+        chart_file = generate_chart(pair, timeframe)
+        if chart_file:
+            with open(chart_file, 'rb') as photo:
+                await bot.send_photo(chat_id=chat_id, photo=photo)
+            os.remove(chart_file)
+        else:
+            await bot.send_message(chat_id=chat_id, text="No data available.")
     return {"statusCode": HTTPStatus.OK}
 
-# Daily Cron for Swap Monitoring
+# Vercel Cron for Swap Monitoring
 async def monitor_swaps():
     bot = Bot(TELEGRAM_TOKEN)
-    latest_block = w3.eth.get_block('latest').number
-    start_block = latest_block - 6050  # ~24h
-    for pair, contract in contracts.items():
+    filters = {pair: contract.events.Swap.createFilter(fromBlock='latest') for pair, contract in contracts.items()}
+    for pair, filter in filters.items():
         try:
-            events = contract.events.Swap.getLogs(fromBlock=start_block, toBlock=latest_block)
-            for event in events:
-                tx_hash = event['transactionHash'].hex()
-                if transactions.find_one({"tx_hash": tx_hash}):
-                    continue
+            for event in filter.get_new_entries():
                 amount0_in = event['args']['amount0In']
                 amount1_in = event['args']['amount1In']
                 amount0_out = event['args']['amount0Out']
                 amount1_out = event['args']['amount1Out']
                 to = event['args']['to']
-                token0 = contract.functions.token0().call().lower()
+                tx_hash = event['transactionHash'].hex()
+                token0 = contracts[pair].functions.token0().call().lower()
                 is_buy = False
                 amount = 0
                 token_name = "BESC" if pair != "Money-BESC" else "Money"
@@ -230,7 +276,7 @@ async def monitor_swaps():
                     amount = amount1_out / 10 ** DECIMALS["Money"]
                 if is_buy:
                     metrics = get_price(pair, contracts[pair])
-                    usd_value = amount * metrics['price']
+                    usd_value = amount * metrics["price"]
                     for user in users.find({"alerts": True}):
                         if user.get("thresholds", {}).get("price", 0) <= metrics["price"]:
                             alert = f"🔔 *{pair} Buy Alert* 📈\n" \
@@ -243,12 +289,12 @@ async def monitor_swaps():
                                     f"24h Volume: ${metrics['volume_24h']:,.2f}\n" \
                                     f"Tx: https://explorer.vscblockchain.org/tx/{tx_hash}"
                             transactions.insert_one({
-                                "tx_hash": tx_hash,
                                 "pair": pair,
                                 "amount": amount,
                                 "usd_value": usd_value,
-                                "price": metrics['price'],
-                                "timestamp": datetime.now().timestamp()
+                                "price": metrics["price"],
+                                "timestamp": datetime.now().timestamp(),
+                                "tx_hash": tx_hash
                             })
                             await bot.send_animation(
                                 chat_id=user.get("chat_id", CHAT_ID),
