@@ -60,6 +60,15 @@ mongo_client = MongoClient(MONGO_URI)
 db = mongo_client["vsc_bot"]
 prices = db["prices"]
 transactions = db["transactions"]
+users = db["users"]
+
+# User Settings
+def get_user_settings(user_id):
+    user = users.find_one({"user_id": user_id}) or {"alerts": True, "thresholds": {}, "wallets": []}
+    return user
+
+def update_user_settings(user_id, settings):
+    users.update_one({"user_id": user_id}, {"$set": settings}, upsert=True)
 
 # Get Price
 def get_price(pair, contract):
@@ -155,10 +164,14 @@ async def handler(req):
     body = await req.json() if req.method == "POST" else {}
     command = body.get("message", {}).get("text", "")
     chat_id = body.get("message", {}).get("chat", {}).get("id", CHAT_ID)
-    user_id = body.get("message", {}).get("from", {}).get("id")
+    user_id = body.get("message.from_user.id", "")
 
-    if command.startswith("/start"):
-        await bot.send_message(chat_id=chat_id, text="Welcome to BESC Bot! 🚀\n/chart <pair> - View charts\n/stats <pair> - View stats")
+    if command == "/start":
+        update_user_settings(user_id, {"alerts": True, "thresholds": {}, "wallets": [], "chat_id": chat_id})
+        await bot.send_message(
+            chat_id=chat_id,
+            text="Welcome to BESC Bot! 🚀\n/chart <pair> - View charts\n/stats <pair> - View stats\n/setalert price > 0.1\n/portfolio\n/addwallet <address>\n/alerts on/off"
+        )
     elif command.startswith("/chart"):
         pair = command.split()[1] if len(command.split()) > 1 else "BESC-BUSDC"
         if pair not in contracts:
@@ -178,6 +191,48 @@ async def handler(req):
                 f"Liquidity: ${metrics['liquidity']:,.2f}\n" \
                 f"24h Volume: ${metrics['volume_24h']:,.2f}"
         await bot.send_message(chat_id=chat_id, text=reply, parse_mode="Markdown")
+    elif command.startswith("/setalert"):
+        args = command.split()[1:]
+        if not args:
+            await bot.send_message(chat_id=chat_id, text="Use: /setalert price > 0.1")
+            return {"statusCode": HTTPStatus.OK}
+        try:
+            threshold = float(args[2])
+            settings = get_user_settings(user_id)
+            settings["thresholds"]["price"] = threshold
+            update_user_settings(user_id, settings)
+            await bot.send_message(chat_id=chat_id, text=f"Alert set for price {args[1]} {threshold}")
+        except:
+            await bot.send_message(chat_id=chat_id, text="Invalid format.")
+    elif command.startswith("/alerts"):
+        args = command.split()[1] if len(command.split()) > 1 else ""
+        settings = get_user_settings(user_id)
+        settings["alerts"] = args.lower() == "on"
+        update_user_settings(user_id, settings)
+        await bot.send_message(chat_id=chat_id, text=f"Alerts {'enabled' if settings['alerts'] else 'disabled'}.")
+    elif command.startswith("/portfolio"):
+        settings = get_user_settings(user_id)
+        wallets = settings.get("wallets", [])
+        if not wallets:
+            await bot.send_message(chat_id=chat_id, text="No wallets. Use /addwallet <address>.")
+            return {"statusCode": HTTPStatus.OK}
+        reply = "💼 *Portfolio*\n"
+        for wallet in wallets:
+            try:
+                balance = w3.eth.get_balance(wallet) / 10 ** 18  # VSG balance
+                reply += f"Wallet {wallet[:6]}...: {balance:.4f} VSG\n"
+            except:
+                reply += f"Wallet {wallet[:6]}...: Error fetching balance\n"
+        await bot.send_message(chat_id=chat_id, text=reply, parse_mode="Markdown")
+    elif command.startswith("/addwallet"):
+        wallet = command.split()[1] if len(command.split()) > 1 else ""
+        if not wallet or not w3.isAddress(wallet):
+            await bot.send_message(chat_id=chat_id, text="Invalid wallet address.")
+            return {"statusCode": HTTPStatus.OK}
+        settings = get_user_settings(user_id)
+        settings["wallets"] = settings.get("wallets", []) + [wallet]
+        update_user_settings(user_id, settings)
+        await bot.send_message(chat_id=chat_id, text=f"Wallet {wallet[:6]}... added.")
     elif body.get("callback_query"):
         query = body["callback_query"]
         data = query["data"]
@@ -191,20 +246,26 @@ async def handler(req):
             await bot.send_message(chat_id=chat_id, text="No data available.")
     return {"statusCode": HTTPStatus.OK}
 
-# Vercel Cron for Swap Monitoring
+# Daily Cron for Swap Monitoring
 async def monitor_swaps():
     bot = Bot(TELEGRAM_TOKEN)
-    filters = {pair: contract.events.Swap.createFilter(fromBlock='latest') for pair, contract in contracts.items()}
-    for pair, filter in filters.items():
+    # Fetch last 24h blocks (approx 6,050 blocks at 14.3s/block)
+    latest_block = w3.eth.get_block('latest').number
+    start_block = latest_block - 6050  # ~24h
+    for pair, contract in contracts.items():
         try:
-            for event in filter.get_new_entries():
+            events = contract.events.Swap.getLogs(fromBlock=start_block, toBlock=latest_block)
+            for event in events:
+                tx_hash = event['transactionHash'].hex()
+                # Skip if already processed
+                if transactions.find_one({"tx_hash": tx_hash}):
+                    continue
                 amount0_in = event['args']['amount0In']
                 amount1_in = event['args']['amount1In']
                 amount0_out = event['args']['amount0Out']
                 amount1_out = event['args']['amount1Out']
                 to = event['args']['to']
-                tx_hash = event['transactionHash'].hex()
-                token0 = contracts[pair].functions.token0().call().lower()
+                token0 = contract.functions.token0().call().lower()
                 is_buy = False
                 amount = 0
                 token_name = "BESC" if pair != "Money-BESC" else "Money"
@@ -228,36 +289,40 @@ async def monitor_swaps():
                     amount = amount1_out / 10 ** DECIMALS["Money"]
                 if is_buy:
                     metrics = get_price(pair, contracts[pair])
-                    usd_value = amount * metrics["price"]
-                    alert = f"🔔 *{pair} Buy Alert* 📈\n" \
-                            f"Buyer: {to[:6]}...{to[-4:]}\n" \
-                            f"Amount: {amount:,.2f} {token_name}\n" \
-                            f"USD Value: ${usd_value:,.2f}\n" \
-                            f"Price: ${metrics['price']:.6f}\n" \
-                            f"Market Cap: ${metrics['market_cap']:,.2f}\n" \
-                            f"Liquidity: ${metrics['liquidity']:,.2f}\n" \
-                            f"24h Volume: ${metrics['volume_24h']:,.2f}\n" \
-                            f"Tx: https://explorer.vscblockchain.org/tx/{tx_hash}"
-                    transactions.insert_one({
-                        "pair": pair,
-                        "amount": amount,
-                        "usd_value": usd_value,
-                        "price": metrics["price"],
-                        "timestamp": datetime.now().timestamp(),
-                        "tx_hash": tx_hash
-                    })
-                    await bot.send_animation(
-                        chat_id=CHAT_ID,
-                        animation=BUY_GIF_URL,
-                        caption=alert,
-                        parse_mode="Markdown"
-                    )
+                    usd_value = amount * metrics['price']
+                    for user in users.find({"alerts": True}):
+                        if user.get("thresholds", {}).get("price", 0) <= metrics["price"]:
+                            alert = f"🔔 *{pair} Buy Alert* 📈\n" \
+                                    f"Buyer: {to[:6]}...{to[-4:]}\n" \
+                                    f"Amount: {amount:,.2f} {token_name}\n" \
+                                    f"USD Value: ${usd_value:,.2f}\n" \
+                                    f"Price: ${metrics['price']:.6f}\n" \
+                                    f"Market Cap: ${metrics['market_cap']:,.2f}\n" \
+                                    f"Liquidity: ${metrics['liquidity']:,.2f}\n" \
+                                    f"24h Volume: ${metrics['volume_24h']:,.2f}\n" \
+                                    f"Tx: https://explorer.vscblockchain.org/tx/{tx_hash}"
+                            transactions.insert_one({
+                                "tx_hash": tx_hash,
+                                "pair": pair,
+                                "amount": amount,
+                                "usd_value": usd_value,
+                                "price": metrics['price'],
+                                "timestamp": datetime.now().timestamp()
+                            })
+                            await bot.send_animation(
+                                chat_id=user.get("chat_id", CHAT_ID),
+                                animation=BUY_GIF_URL,
+                                caption=alert,
+                                parse_mode="Markdown"
+                            )
         except Exception as e:
             logger.error(f"Swap error for {pair}: {e}")
-    return {"statusCode": HTTPStatus.OK}
+    else
+        return {"statusCode": HTTPStatus.OK}
 
 def vercel(event, context):
     import asyncio
     if event["path"] == "/api/monitor":
         return asyncio.run(monitor_swaps())
-    return asyncio.run(handler(event["body"]))
+    else:
+        return asyncio.run(handler(event["body"]))
