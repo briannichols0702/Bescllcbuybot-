@@ -1,25 +1,25 @@
 {
-    "version": 2",
-    "builds": [
-        {
-            "src": "api/bot.py",
-            "use": "@vercel/python"
-        }
-    ],
-    "routes": [
-        {
-            "src": "/api/bot",
-            "dest": "api/bot.py"
-        },
-        {
-            "src": "/api/monitor",
-            "dest": "api/bot.py"
-        }
-    ],
-    "crons": [
-        {
-             "path": "/api/monitor",
-             "schedule": "0 2 * * *"
-        }
-    ]
+  "version": 2,
+  "builds": [
+    {
+      "src": "api/bot.py",
+      "use": "@vercel/python"
+    }
+  ],
+  "routes": [
+    {
+      "src": "/api/bot",
+      "dest": "api/bot.py"
+    },
+    {
+      "src": "/api/monitor",
+      "dest": "api/bot.py"
+    }
+  ],
+  "crons": [
+    {
+      "path": "/api/monitor",
+      "schedule": "*/5 * * * *"
+    }
+  ]
 }
