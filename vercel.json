@@ -15,12 +15,16 @@
       "src": "/api/monitor",
       "dest": "api/bot.py"
     }
-  
   ],
-    "crons": [
-        {
-             "path": "/api/monitor",
-             "schedule": "0 2 * * *"
-        }
-    ]
+  "functions": {
+    "api/bot.py": {
+      "excludeFiles": "{.git,.github,.venv,tests,__pycache__,node_modules,*.cache,public,docs}/**"
+    }
+  },
+  "crons": [
+    {
+      "path": "/api/monitor",
+      "schedule": "0 2 * * *"
+    }
+  ]
 }
