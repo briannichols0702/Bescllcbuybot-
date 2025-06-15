@@ -15,11 +15,12 @@
       "src": "/api/monitor",
       "dest": "api/bot.py"
     }
+  
   ],
-  "crons": [
-    {
-      "path": "/api/monitor",
-      "schedule": "*/5 * * * *"
-    }
-  ]
+    "crons": [
+        {
+             "path": "/api/monitor",
+             "schedule": "0 2 * * *"
+        }
+    ]
 }
